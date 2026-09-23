@@ -32,3 +32,15 @@ class CompareRequest(BaseModel):
     after_id: int = Field(
         ..., ge=1, description="ID of the later audit record (regression)."
     )
+
+
+class DiffAuditRequest(BaseModel):
+    diff: str = Field(
+        ...,
+        description=(
+            "Unified diff text. Only added ('+') lines inside hunks are "
+            "audited; file headers, removed/context lines and '\\ No "
+            "newline' markers are ignored. One record is stored per file "
+            "that contains added content."
+        ),
+    )

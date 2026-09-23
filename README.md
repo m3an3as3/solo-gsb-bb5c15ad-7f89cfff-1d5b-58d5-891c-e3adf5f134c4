@@ -155,6 +155,107 @@ curl -s -X POST http://localhost:8000/api/v1/audits \
 # ["RLO at logical index 0 (line 1, col 1) is never closed by PDF"]
 ```
 
+### `POST /api/v1/audits/diff` — 统一 diff 审计
+
+直接接收 **unified diff 文本**，只分析各文件 hunk 中以 `+` 开头的**新增内容**：
+文件头、删除行（`-`）、上下文行（空格前缀）以及 `\ No newline at end of file`
+标记均不参与审计。支持多文件、多 hunk；解析器在每个 hunk 内按**新文件行号**
+（`@@ -old[,n] +new[,n] @@` 的新侧起始值与计数）推进，命中的控制符、错误与危险
+区段都会回映射到：
+
+- 新文件路径（`+++` 头，自动去掉 git 的 `a/`/`b/` 前缀，`/dev/null` 视为删除）；
+- 新文件中的**行、列**；
+- 对应新增行在 **diff 文本中的物理行号**（1 起始）；
+
+同时保留原解析结果中的 `logical_index`（相对于“本文件全部新增行拼接文本”的
+码点偏移）与原 `position`。
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/audits/diff \
+  -H 'Content-Type: application/json' \
+  --data-binary @- <<'JSON' | jq
+{
+  "diff": "diff --git a/src/x.js b/src/x.js\n--- a/src/x.js\n+++ b/src/x.js\n@@ -10,2 +10,2 @@\n const ok = 1;\n-old\n+const s = \"‮evil.js‬\";\n"
+}
+JSON
+```
+
+响应（节选）：
+
+```json
+{
+  "stored": true,
+  "file_count": 1,
+  "risk_level": "high",
+  "files": [
+    {
+      "id": 3,
+      "path": "src/x.js",
+      "stored": true,
+      "added_line_count": 1,
+      "risk_level": "high",
+      "result": { "...": "新增行拼接文本的完整 parse_bidi 结果" },
+      "controls": [
+        {
+          "codepoint": "U+202E",
+          "abbreviation": "RLO",
+          "logical_index": 11,
+          "position": {"line": 1, "column": 12},
+          "risk": "high",
+          "path": "src/x.js",
+          "file_position": {"line": 11, "column": 12},
+          "diff_line": 7
+        }
+      ],
+      "errors": [],
+      "dangerous_spans": [
+        {
+          "start": 11, "end": 19, "opener": "RLO", "risk": "high",
+          "path": "src/x.js",
+          "start_position": {"line": 11, "column": 12},
+          "end_position":   {"line": 11, "column": 20},
+          "start_diff_line": 7,
+          "end_diff_line": 7
+        }
+      ]
+    }
+  ]
+}
+```
+
+说明：
+
+- **每个含新增内容的文件各保存一条审计记录**（删除-only 的文件不产生记录），
+  记录的 `filename` 为新文件路径、`raw_text` 为该文件全部新增行按新文件顺序
+  拼接的文本，可直接用于 `GET /api/v1/audits/{id}`、`/verify`、`/sarif`。
+- 顶层 `risk_level` 是所有文件结果的**最高风险**；`files[]` 按 diff 中出现的
+  顺序返回并各自带记录 `id`。
+- 未闭合错误（如 RLO 无 PDF）同样回映射：`errors[]` 中每项带 `message`、
+  锚点 `logical_index`、`path`、`file_position`、`diff_line`。
+- 无换行文件（`\ No newline at end of file`）会被正确处理：标记不消耗行号，
+  相邻新增内容按同一文件行拼接。
+
+错误情况（返回 422，且**绝不写入任何记录**——整份 diff 先解析校验通过后才落库）：
+
+```json
+{
+  "detail": {
+    "error": "invalid_unified_diff",
+    "message": "hunk starting at diff line 4 declares 1 old/1 new lines but its body contains 0 old/1 new lines",
+    "diff_line": 6
+  }
+}
+```
+
+| 条件 | `diff_line` 指向 |
+|---|---|
+| diff 为空 / 全空白 | 第 1 行 |
+| hunk 头畸形（不符合 `@@ -l[,n] +l[,n] @@`） | 该 hunk 头行 |
+| hunk 出现在 `+++` 文件头之前 / body 行出现在所有 hunk 之外 | 该行 |
+| hunk 实际行数多于头部声明（old 或 new 侧） | 首个多出的 body 行 |
+| hunk 在输入结束或下一个文件头处被截断（行数少于声明） | 第一行缺失的位置 |
+| `\ No newline …` 标记未附着在 body 行上 / 出现在 hunk 之外 | 该标记行 |
+
 ### `GET /api/v1/audits` — 查询历史记录
 
 支持按风险级别精确过滤、按文件名（大小写不敏感子串）过滤与分页：
@@ -461,6 +562,7 @@ print(json.dumps(json.load(urllib.request.urlopen(req)), ensure_ascii=False, ind
 ├── app/
 │   ├── __init__.py
 │   ├── bidi.py        # UAX#9 控制符解析、配对栈、风险评级、转义预览
+│   ├── diffparse.py   # unified diff 解析（多文件/多 hunk/No newline）+ 新增行回映射
 │   ├── compare.py     # 两条已存审计记录的回归比较（按缩写+出现次序配对）
 │   ├── verify.py      # 重算校验：从原文重新解析并与存储结果逐字段 diff
 │   ├── sarif.py       # 已存审计 -> SARIF 2.1.0（rule/result、UTF-16 列、指纹）
@@ -471,6 +573,7 @@ print(json.dumps(json.load(urllib.request.urlopen(req)), ensure_ascii=False, ind
 ├── tests/
 │   ├── conftest.py    # 共享的临时 DB / TestClient fixture
 │   ├── test_bidi.py   # 解析器单元测试 + API 冒烟测试
+│   ├── test_diff.py   # 统一 diff 接口测试（多文件/多 hunk/回映射/422/不写库）
 │   ├── test_compare.py # 回归比较接口测试（新增/消失/位移/配对范围/404/422）
 │   ├── test_verify.py  # 重算校验接口测试（一致/篡改/缺失 vs null/只读/404）
 │   └── test_sarif.py  # SARIF 导出测试（level 映射/UTF-16 列/指纹/排序/404）
@@ -490,7 +593,13 @@ python -m pytest tests/ -q
 
 覆盖：清洁文本、RLO 高风险、未闭合 RLO critical、LRE/PDF 配对、孤立 PDF/PDI、
 LRI/PDI 隔离配对、隔离内嵌入隐式关闭、PDF 跳过隔离层（X9）、行列定位、
-嵌套深度、转义预览，以及 API 的创建/详情/过滤/404；比较接口覆盖相同结果、
+嵌套深度、转义预览，以及 API 的创建/详情/过滤/404；统一 diff 接口覆盖
+忽略文件头/删除行/上下文行、多文件每文件一条记录、删除-only 文件不落库、
+多 hunk 新文件行号推进、控制符/错误/危险区段回映射到文件行列与 diff 行、
+保留 logical_index、`\ No newline` 行号抑制、空 diff、畸形 hunk 头、
+hunk 行数与头部不一致（多余行/EOF 截断/old-new 不匹配）、标记游离、
+首个错误 diff 行定位、422 时整批不写库以及与 verify/SARIF 记录复用；
+比较接口覆盖相同结果、
 新增/消失、仅位置平移、配对范围变化（孤立/配对对象/跨度）、按缩写与出现次序
 配对、标记配对、风险升级与错误数、以及 404 / 422 错误分支；重算校验接口覆盖
 一致记录、标量/嵌套字段/数组元素篡改定位、缺失键与 null 的区分、数组长度

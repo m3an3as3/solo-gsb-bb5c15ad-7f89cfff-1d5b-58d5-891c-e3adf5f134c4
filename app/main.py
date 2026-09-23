@@ -10,8 +10,9 @@ from fastapi.responses import JSONResponse
 from .bidi import RiskLevel, parse_bidi
 from .compare import compare_audits
 from .database import count_audits, get_audit, init_db, insert_audit, query_audits
+from .diffparse import DiffFormatError, audit_diff, highest_risk
 from .sarif import build_sarif
-from .schemas import AuditRequest, CompareRequest
+from .schemas import AuditRequest, CompareRequest, DiffAuditRequest
 from .verify import verify_audit_record
 
 app = FastAPI(
@@ -46,6 +47,53 @@ def create_audit(payload: AuditRequest) -> dict:
     )
     return {"id": audit_id, "risk_level": result["risk_level"],
             "stored": True, "result": result}
+
+
+@app.post("/api/v1/audits/diff", status_code=201)
+def audit_unified_diff(payload: DiffAuditRequest) -> dict:
+    """Audit only the added ('+') lines of a unified diff.
+
+    The whole diff is parsed and validated first; on any structural error
+    (or a hunk whose body length disagrees with its header) a 422 is
+    returned pointing at the first offending diff line and **no records are
+    written**. On success one record is stored per file that has added
+    content; hits are mapped back to new-file path / line / column and the
+    owning diff line while the parser's logical indices are retained.
+    """
+    try:
+        plans = audit_diff(payload.diff)
+    except DiffFormatError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "invalid_unified_diff",
+                "message": exc.message,
+                "diff_line": exc.diff_line,
+            },
+        )
+
+    files: list[dict] = []
+    for plan in plans:
+        result = plan["result"]
+        audit_id = insert_audit(
+            filename=plan["path"], text=plan["text"], result=result
+        )
+        files.append({
+            "id": audit_id,
+            "path": plan["path"],
+            "stored": True,
+            "added_line_count": plan["added_line_count"],
+            "risk_level": plan["risk_level"],
+            "result": result,
+            **plan["mapped"],
+        })
+
+    return {
+        "stored": True,
+        "file_count": len(files),
+        "risk_level": highest_risk([f["risk_level"] for f in files]),
+        "files": files,
+    }
 
 
 @app.post("/api/v1/audits/compare")
@@ -134,6 +182,7 @@ def root() -> dict:
         "docs": "/docs",
         "endpoints": [
             "POST /api/v1/audits",
+            "POST /api/v1/audits/diff",
             "POST /api/v1/audits/compare",
             "GET  /api/v1/audits",
             "GET  /api/v1/audits/{id}",
