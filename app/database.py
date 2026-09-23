@@ -23,12 +23,20 @@ CREATE TABLE IF NOT EXISTS audits (
     control_count INTEGER NOT NULL,
       -- raw input is retained so it can be reviewed later
     raw_text      TEXT    NOT NULL,
-    result_json   TEXT    NOT NULL
+    result_json   TEXT    NOT NULL,
+      -- optional source/mapping metadata (e.g. unified-diff locations);
+      -- kept out of result_json so verify compares the raw parse result
+    meta_json     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_audits_risk     ON audits(risk_level);
 CREATE INDEX IF NOT EXISTS idx_audits_filename ON audits(filename);
 CREATE INDEX IF NOT EXISTS idx_audits_created  ON audits(created_at);
 """
+
+# Columns added after the initial release (name -> column DDL).
+_ADDED_COLUMNS = {
+    "meta_json": "TEXT",
+}
 
 
 def init_db(db_path: Optional[str] = None) -> None:
@@ -37,6 +45,10 @@ def init_db(db_path: Optional[str] = None) -> None:
     os.makedirs(directory, exist_ok=True)
     with sqlite3.connect(path) as conn:
         conn.executescript(_SCHEMA)
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(audits)")}
+        for name, ddl in _ADDED_COLUMNS.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE audits ADD COLUMN {name} {ddl}")
         conn.commit()
 
 
@@ -52,14 +64,20 @@ def connect(db_path: Optional[str] = None) -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
-def insert_audit(*, filename: Optional[str], text: str, result: dict) -> int:
+def insert_audit(
+    *,
+    filename: Optional[str],
+    text: str,
+    result: dict,
+    meta: Optional[dict] = None,
+) -> int:
     with connect() as conn:
         cur = conn.execute(
             """
             INSERT INTO audits (created_at, filename, text_length, risk_level,
                                 max_depth, error_count, control_count,
-                                raw_text, result_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                raw_text, result_json, meta_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 time.time(),
@@ -71,6 +89,7 @@ def insert_audit(*, filename: Optional[str], text: str, result: dict) -> int:
                 result["stats"]["total_control_chars"],
                 text,
                 json.dumps(result, ensure_ascii=False),
+                json.dumps(meta, ensure_ascii=False) if meta is not None else None,
             ),
         )
         return int(cur.lastrowid)
@@ -141,4 +160,6 @@ def get_audit(audit_id: int) -> Optional[dict]:
     detail = _row_to_summary(row)
     detail["raw_text"] = row["raw_text"]
     detail["result"] = json.loads(row["result_json"])
+    if row["meta_json"]:
+        detail["meta"] = json.loads(row["meta_json"])
     return detail

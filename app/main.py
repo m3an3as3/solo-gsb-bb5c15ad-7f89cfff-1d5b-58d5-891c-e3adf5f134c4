@@ -10,8 +10,9 @@ from fastapi.responses import JSONResponse
 from .bidi import RiskLevel, parse_bidi
 from .compare import compare_audits
 from .database import count_audits, get_audit, init_db, insert_audit, query_audits
+from .diff_audit import DiffParseError, audit_diff, highest_risk
 from .sarif import build_sarif
-from .schemas import AuditRequest, CompareRequest
+from .schemas import AuditRequest, CompareRequest, DiffAuditRequest
 from .verify import verify_audit_record
 
 app = FastAPI(
@@ -63,6 +64,65 @@ def compare_records(payload: CompareRequest) -> dict:
     if after is None:
         raise HTTPException(status_code=404, detail="after audit record not found")
     return compare_audits(before, after)
+
+
+@app.post("/api/v1/audits/diff", status_code=201)
+def create_diff_audit(payload: DiffAuditRequest) -> dict:
+    """Audit only the added lines of a unified diff.
+
+    Parses multi-file / multi-hunk unified diff text and, for every file
+    containing added lines, rebuilds that file's added content in new-file
+    order, runs the bidi parser on it and maps each finding back to the
+    new-file path/line/column and to the diff line it came from.  One
+    record is persisted per file.  A structurally invalid diff (or a hunk
+    whose body does not match its header counts) yields 422 with the first
+    offending diff line and writes nothing.
+    """
+    try:
+        audits = audit_diff(payload.diff)
+    except DiffParseError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "invalid_unified_diff",
+                "line": exc.line_no,
+                "message": exc.message,
+            },
+        )
+
+    # Only persist after the entire diff has parsed and audited cleanly,
+    # so a malformed input never writes partial records.
+    items = []
+    for audit in audits:
+        audit_id = insert_audit(
+            filename=audit.new_path,
+            text=audit.text,
+            result=audit.result,
+            meta=audit.meta,
+        )
+        items.append({
+            "id": audit_id,
+            "stored": True,
+            "path": audit.new_path,
+            "old_path": audit.old_path,
+            "text_length": audit.result["length"],
+            "risk_level": audit.result["risk_level"],
+            "max_depth": audit.result["max_depth"],
+            "error_count": audit.result["error_count"],
+            "control_count": audit.result["stats"]["total_control_chars"],
+            "dangerous_span_count": audit.result["stats"]["dangerous_span_count"],
+            "added_line_count": len(audit.entries),
+            "added_lines": audit.meta["added_lines"],
+            "result": audit.result,
+            "locations": audit.locations,
+        })
+
+    return {
+        "stored": True,
+        "file_count": len(items),
+        "risk_level": highest_risk([item["risk_level"] for item in items]),
+        "items": items,
+    }
 
 
 @app.get("/api/v1/audits")
@@ -134,6 +194,7 @@ def root() -> dict:
         "docs": "/docs",
         "endpoints": [
             "POST /api/v1/audits",
+            "POST /api/v1/audits/diff",
             "POST /api/v1/audits/compare",
             "GET  /api/v1/audits",
             "GET  /api/v1/audits/{id}",

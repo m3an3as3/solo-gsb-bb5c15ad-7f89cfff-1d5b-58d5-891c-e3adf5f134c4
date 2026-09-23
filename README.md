@@ -49,6 +49,7 @@ docker compose up --build
 
 服务在 <http://localhost:8000> 启动，交互式文档：<http://localhost:8000/docs>。
 SQLite 数据文件保存在命名卷 `bidi-audit-data`（容器内 `/data/audit.db`）。
+启动方式无需改动，新增的 `POST /api/v1/audits/diff` 随服务一起可用。
 
 ### 仅用 Docker
 
@@ -154,6 +155,133 @@ curl -s -X POST http://localhost:8000/api/v1/audits \
 # "critical"
 # ["RLO at logical index 0 (line 1, col 1) is never closed by PDF"]
 ```
+
+### `POST /api/v1/audits/diff` — 统一 diff 审计
+
+接收一段 **unified diff** 文本（`git diff` / `diff -u` 风格，支持多文件、多 hunk、
+重命名、模式变更、二进制补丁以及 `\ No newline at end of file` 标记），**只审计
+各 hunk 中以 `+` 开头的新增行**：文件头、删除行（`-`）、上下文行（前导空格）与
+No-newline 标记只参与结构解析，不参与分析。
+
+对每个**含新增内容的文件**，按新文件行号顺序重建新增文本并运行 bidi 解析器，再把
+命中的**控制符、错误与危险区段**回映射到：
+
+- 新文件路径（`path`，删除文件 `/dev/null` 不产生记录）、新文件的行/列（`position`，
+  1 起始，按 hunk 头的 `+起始行,行数` 推进，删除行不推进）；
+- 对应 diff 的行/列（`diff_position`，diff 行号 1 起始，列因前导 `+` 整体 +1）；
+- 原解析结果中的逻辑索引与数组下标（`logical_index` / `start_logical_index` /
+  `end_logical_index` 与 `result_index`），解析结果本身保持不变。
+
+成功后为每个含新增内容的文件**各保存一条审计记录**（`filename` 为新文件路径，
+重建的新增文本存入 `raw_text`，映射信息存入记录的 `meta` 字段，可通过
+`GET /api/v1/audits/{id}` 取回），返回各记录 ID 与跨文件汇总的最高风险。
+
+```bash
+cat > evil.diff <<'PATCH'
+diff --git a/src/app.py b/src/app.py
+--- a/src/app.py
++++ b/src/app.py
+@@ -1,2 +1,3 @@
+ import sys
+-old = 1
++name = '‮evil.exe‬'
++print(name)
+PATCH
+
+curl -s -X POST http://localhost:8000/api/v1/audits/diff \
+  -H 'Content-Type: application/json' \
+  --data-binary @evil.diff | jq
+```
+
+响应（节选）：
+
+```json
+{
+  "stored": true,
+  "file_count": 1,
+  "risk_level": "high",
+  "items": [
+    {
+      "id": 13,
+      "stored": true,
+      "path": "src/app.py",
+      "old_path": "src/app.py",
+      "text_length": 51,
+      "risk_level": "high",
+      "max_depth": 1,
+      "error_count": 0,
+      "control_count": 2,
+      "dangerous_span_count": 1,
+      "added_line_count": 2,
+      "added_lines": [
+        {"new_line": 2, "diff_line": 6, "no_newline": false},
+        {"new_line": 3, "diff_line": 7, "no_newline": false}
+      ],
+      "locations": {
+        "controls": [
+          {
+            "result_index": 0,
+            "logical_index": 9,
+            "path": "src/app.py",
+            "position": {"line": 2, "column": 9},
+            "diff_position": {"line": 6, "column": 10}
+          }
+        ],
+        "errors": [],
+        "dangerous_spans": [
+          {
+            "result_index": 0,
+            "start_logical_index": 9,
+            "end_logical_index": 18,
+            "path": "src/app.py",
+            "position": {"start": {"line": 2, "column": 9},
+                         "end": {"line": 2, "column": 18}},
+            "diff_position": {"start": {"line": 6, "column": 10},
+                              "end": {"line": 6, "column": 19}}
+          }
+        ]
+      },
+      "result": { "risk_level": "high", "controls": ["…同 /audits 的原始解析结果…"] }
+    }
+  ]
+}
+```
+
+说明：
+
+- `position` 的行是**新文件行号**（跨 hunk 按各 hunk 头推进，不依赖旧文件行号）；
+  `diff_position` 行是该字符所在 `+` 行在**整个 diff 文本中的行号**，列含前导 `+`
+  的 1 列偏移。`result_index` 可直接索引到 `result.controls[]` / `result.errors[]` /
+  `result.dangerous_spans[]` 的对应元素，`logical_index` 与其保持一致。
+- `result` 是对**重建后新增文本**（无新增行之间的空行拼接问题：按新文件顺序逐行
+  连接，行末按 No-newline 标记决定是否补 `\n`）的原始解析结果，结构与
+  `POST /api/v1/audits` 完全一致，因此该记录同样支持 `verify` 与 `sarif`。
+- 纯删除文件、二进制补丁（`Binary files … differ` / `GIT binary patch` Base85 段）、
+  空文件与无新增行的文件不产生记录（仍计入合法 diff）；所有文件都无新增内容时
+  返回 201、`file_count: 0`、`risk_level: "info"`。
+- git 的 `a/` `b/` 路径前缀与 C 风格引号路径（如 `"src/a b.txt"`）会被还原。
+
+错误情况：
+
+| 状态码 | 条件 |
+|---|---|
+| `422` | diff 结构非法（无文件段、hunk 头格式错误、hunk 出现在文件头之外、hunk 体行首字符非法、No-newline 标记位置/文本错误），或 hunk 体行数与头部声明的旧/新行数不一致 |
+| `422` | 请求体缺少 `diff` 字段（Pydantic 校验） |
+
+行数不一致时（超出在越界行、截断在 hunk 头）都定位到**首个错误的 diff 行号**：
+
+```json
+{
+  "detail": {
+    "error": "invalid_unified_diff",
+    "line": 4,
+    "message": "hunk body exceeds the 1 new line(s) declared by its header"
+  }
+}
+```
+
+校验在任何写入之前完成：解析或 hunk 计数失败时**不写入任何记录**（多文件 diff 中
+后置文件出错，前面的文件同样不会落库）。
 
 ### `GET /api/v1/audits` — 查询历史记录
 
@@ -461,16 +589,18 @@ print(json.dumps(json.load(urllib.request.urlopen(req)), ensure_ascii=False, ind
 ├── app/
 │   ├── __init__.py
 │   ├── bidi.py        # UAX#9 控制符解析、配对栈、风险评级、转义预览
+│   ├── diff_audit.py  # unified diff 解析（多文件/多 hunk/No-newline）+ 新增内容回映射
 │   ├── compare.py     # 两条已存审计记录的回归比较（按缩写+出现次序配对）
 │   ├── verify.py      # 重算校验：从原文重新解析并与存储结果逐字段 diff
 │   ├── sarif.py       # 已存审计 -> SARIF 2.1.0（rule/result、UTF-16 列、指纹）
-│   ├── database.py    # SQLite schema / CRUD / 查询
+│   ├── database.py    # SQLite schema / CRUD / 查询（含可选 meta_json）
 │   ├── schemas.py     # Pydantic 请求模型
 │   ├── main.py        # FastAPI 路由
 │   └── init_db.py     # 独立初始化入口（容器启动调用）
 ├── tests/
 │   ├── conftest.py    # 共享的临时 DB / TestClient fixture
 │   ├── test_bidi.py   # 解析器单元测试 + API 冒烟测试
+│   ├── test_diff_audit.py # unified diff 审计（解析/回映射/422/落库）
 │   ├── test_compare.py # 回归比较接口测试（新增/消失/位移/配对范围/404/422）
 │   ├── test_verify.py  # 重算校验接口测试（一致/篡改/缺失 vs null/只读/404）
 │   └── test_sarif.py  # SARIF 导出测试（level 映射/UTF-16 列/指纹/排序/404）
@@ -499,7 +629,14 @@ SARIF 导出覆盖
 SARIF 信封与工具元数据、清洁/仅标记零发现、文件名与 `audit-{id}` 回退、
 risk→level 映射（error/warning）、未闭合/平衡/孤立/隐式终止各类 rule/result、
 astral 字符与跨行区段的 UTF-16 列、规则去重排序、结果确定性排序、
-partialFingerprints 的稳定性与随范围/规则变化、重复审计同指纹、以及 404。
+partialFingerprints 的稳定性与随范围/规则变化、重复审计同指纹、以及 404；
+unified diff 审计覆盖多文件/多 hunk 解析、仅分析新增行（删除行与上下文行被忽略）、
+按新文件行号推进与列映射、diff 行/列映射与逻辑索引保留、未闭合/孤立/隐式终止错误
+与跨行危险区段回映射、每文件一条记录与汇总最高风险、No-newline 标记（行末/行中）、
+CRLF、git 前缀与引号路径、重命名/删除/新增/空文件、`Binary files` 与
+`GIT binary patch` 段跳过、记录 `meta` 可取回且 verify 仍一致、以及 422 分支
+（空/垃圾输入、hunk 头畸形、缺文件头、体行首非法、标记非法/悬空、头部无 hunk、
+hunk 行数越界指向首个越界行、截断指向 hunk 头、错误落在后续文件时全行不落库）。
 
 ## 设计说明
 
